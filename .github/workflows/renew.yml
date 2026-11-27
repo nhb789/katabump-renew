@@ -24,6 +24,30 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    # 每次运行先把上游 eooce/katabump-renew 的最新脚本同步过来，
+    # 但排除 .github/workflows（保住自己的 cron）和 time.txt（本地生成）
+    - name: 🔄 同步上游最新脚本
+      continue-on-error: true
+      run: |
+        git remote add upstream https://github.com/eooce/katabump-renew.git 2>/dev/null || true
+        git fetch --depth=1 upstream main
+        FILES=$(git ls-tree -r --name-only upstream/main | grep -vE '^(\.github/workflows/|time\.txt$)')
+        if [ -z "$FILES" ]; then echo "上游没有可同步的脚本"; exit 0; fi
+        echo "待同步: $FILES"
+        git checkout upstream/main -- $FILES
+        if git diff --cached --quiet; then
+          echo "✅ 脚本已是最新，无变更"
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git commit -m "🔄 同步上游脚本 $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M')"
+        git push origin HEAD:${{ github.ref_name }} || {
+          git pull --rebase origin ${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
+        }
+        echo "✅ 已更新到上游最新脚本"
+
     - name: ⚙ 设置 Python
       uses: actions/setup-python@v6
       with:
@@ -35,6 +59,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
         pip install seleniumbase requests
+        [ -f requirements.txt ] && pip install -r requirements.txt || true
         seleniumbase install chromedriver
 
     - name: ⚙ 设置代理 (sing-box)
