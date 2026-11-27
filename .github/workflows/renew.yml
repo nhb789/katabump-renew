@@ -2,24 +2,35 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-  - cron: '30 22 */3 * *'  # 每天 UTC 22:30 (北京时间 6:30点) 运行,根据服务到期时间自行修改
-  workflow_dispatch: # 允许手动触发
+  # 每天两次尝试（GitHub 在高峰期会丢弃部分 schedule，双点互为备份）
+  - cron: '30 22 * * *'   # 北京时间 06:30
+  - cron: '30 10 * * *'   # 北京时间 18:30（补跑）
+  workflow_dispatch:
+
+# 同一时刻只跑一个，避免 time.txt 提交撞车
+concurrency:
+  group: katabump-renew
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   Renew-Katabump:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
-    
+    timeout-minutes: 30
+
     steps:
     - uses: actions/checkout@v6
+
     - name: ⚙ 设置 Python
       uses: actions/setup-python@v6
       with:
         python-version: '3.12'
 
     - name: 🛠️ 安装系统依赖和python依赖
+      timeout-minutes: 10
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
@@ -33,18 +44,32 @@ jobs:
       run: |
         bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
+    # 脚本挂死也不会拖垮整次运行：15 分钟强制结束，后面的步骤照常执行
     - name: 🚀 运行续期脚本
+      id: renew
+      timeout-minutes: 15
       env:
         KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
         KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
+        set -o pipefail
         xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-          python3 app.py
+          python3 app.py 2>&1 | tee /tmp/renew.log
+        if grep -q "has been renewed" /tmp/renew.log; then
+          echo "✅ 本次续期成功"
+        elif grep -q "can't renew your server yet" /tmp/renew.log; then
+          echo "⏳ 未到续期窗口，属正常"
+        else
+          echo "::error::续期结果异常（可能是服务器不存在或页面改版），见上方日志"
+          exit 1
+        fi
 
-    # 更新时间到time.txt,避免90天未更新导致工作流暂停
+    # 关键：无论续期成功与否都提交一次，仓库保持每天有活动，
+    # 否则 GitHub 会在仓库 60 天无活动后自动停用 schedule（这次断链就是这么来的）
     - name: 🕒 更新运行时间
+      if: always()
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -52,22 +77,39 @@ jobs:
         git add time.txt
         if git diff --cached --quiet; then
           echo "No need to commit"
-        else
-          git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-          git push origin main
+          exit 0
         fi
-        
+        git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+        git push origin HEAD:${{ github.ref_name }} || {
+          echo "push 冲突，rebase 后重试"
+          git pull --rebase origin ${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
+        }
+
+    - name: 📣 失败告警
+      if: failure()
+      env:
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      run: |
+        [ -z "$TG_BOT_TOKEN" ] && { echo "未配置 TG，跳过"; exit 0; }
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+          -d chat_id="${TG_CHAT_ID}" \
+          --data-urlencode "text=❌ Katabump 续期异常
+        仓库: ${{ github.repository }}
+        日志: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null || true
+
+    # 只保留最近 10 条记录：按文件名查，改过显示名也不会报错
     - name: 🧹 清理旧的工作流运行记录
       if: always()
+      continue-on-error: true
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-        count=0
-        for run_id in $runs; do
-          count=$((count + 1))
-          if [ $count -gt 1 ]; then
-            echo "删除运行记录: $run_id"
-            gh run delete $run_id || true
-          fi
-        done
+        gh run list --workflow=renew.yml --limit=30 --json databaseId \
+          --jq '.[].databaseId' | tail -n +11 | while read -r id; do
+            [ -z "$id" ] && continue
+            echo "删除运行记录: $id"
+            gh run delete "$id" || true
+          done
+        echo "done"
